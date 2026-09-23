@@ -274,7 +274,11 @@ try {
     $promptEvent.prompt = ('b' * 6001)
     $null = Invoke-Hook $promptEvent ''
     $request.session_id = $longSession
-    Assert-True (@((Invoke-Hook $request $mock)).Count -eq 0) 'Oversized user history was automatically allowed'
+    $result = @((Invoke-Hook $request $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and $captured.state.user_messages.Count -eq 2 -and
+        @($captured.state.user_messages | Where-Object { $_.Length -le 4000 -and $_.Contains('characters omitted') }).Count -eq 2 -and
+        $captured.state.user_messages[1].StartsWith('bbb') -and $captured.state.user_messages[1].EndsWith('bbb')) 'Oversized user messages were not shortened and reviewed'
     $passed++
 
     $sixSession = [Guid]::NewGuid().ToString()
@@ -289,7 +293,25 @@ try {
     Assert-True ($result.Count -eq 1 -and $captured.state.user_messages.Count -eq 6) 'Six user messages were not sent in one call'
     $promptEvent.prompt = 'Seventh instruction'
     $null = Invoke-Hook $promptEvent ''
-    Assert-True (@((Invoke-Hook $request $mock)).Count -eq 0) 'Incomplete history after seventh message was automatically allowed'
+    $result = @((Invoke-Hook $request $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and $captured.state.user_messages.Count -eq 6 -and
+        $captured.state.user_messages[0] -eq 'User instruction 1' -and $captured.state.user_messages[1] -eq 'User instruction 3' -and
+        $captured.state.user_messages[5] -eq 'Seventh instruction' -and $captured.state.omitted_user_message_count -eq 1) 'Seventh message did not keep the first and latest messages'
+    $passed++
+
+    $budgetSession = [Guid]::NewGuid().ToString()
+    $promptEvent.session_id = $budgetSession
+    for ($i = 1; $i -le 6; $i++) {
+        $promptEvent.prompt = "$i" + ('x' * 2999)
+        $null = Invoke-Hook $promptEvent ''
+    }
+    $request.session_id = $budgetSession
+    $result = @((Invoke-Hook $request $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and $captured.state.user_messages.Count -eq 4 -and
+        $captured.state.user_messages[0].StartsWith('1') -and $captured.state.user_messages[1].StartsWith('4') -and
+        $captured.state.omitted_user_message_count -eq 2) 'Character budget did not drop the oldest messages after the first'
     $passed++
 
     $request.session_id = $session
@@ -321,6 +343,8 @@ try {
     $endEvent.session_id = $blankSession
     $null = Invoke-Hook $endEvent ''
     $endEvent.session_id = $sixSession
+    $null = Invoke-Hook $endEvent ''
+    $endEvent.session_id = $budgetSession
     $null = Invoke-Hook $endEvent ''
     $remaining = @(Get-ChildItem (Join-Path $testRoot 'state') -Filter '*.dpapi')
     Assert-True ($remaining.Count -eq 1) 'SessionEnd did not remove only its session state'

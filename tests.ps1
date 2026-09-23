@@ -42,8 +42,48 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
+# Codex runs a hook command string through the session shell: `pwsh -NoProfile -Command <command>`
+# when that shell is PowerShell, otherwise `cmd.exe /c "<command>"`.
+function Invoke-ShellCommand([string]$Shell, [string]$CommandLine, [string]$InputJson) {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    if ($Shell -eq 'pwsh') {
+        $startInfo.FileName = $pwsh
+        foreach ($argument in '-NoProfile', '-Command', $CommandLine) { $startInfo.ArgumentList.Add($argument) }
+    } else {
+        $startInfo.FileName = $env:ComSpec
+        $startInfo.Arguments = '/d /c "' + $CommandLine + '"'
+    }
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::Start($startInfo)
+    $process.StandardInput.Write($InputJson)
+    $process.StandardInput.Close()
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    return @{ ExitCode = $process.ExitCode; Stdout = $stdout.Result; Stderr = $stderr.Result }
+}
+
 $passed = 0
 try {
+    if ($hook.Contains(' ') -or $testRoot.Contains(' ')) { throw 'Install and test from a path without spaces; the portable hook command is unquoted' }
+    $example = Get-Content -Raw (Join-Path $PSScriptRoot 'hooks.example.json') | ConvertFrom-Json
+    $exampleCommands = @($example.hooks.PSObject.Properties.Value | ForEach-Object { $_.hooks.command } | Select-Object -Unique)
+    Assert-True ($exampleCommands.Count -eq 1) 'hooks.example.json events use different commands'
+    $shellCommand = $exampleCommands[0].Replace('C:/path/to/codex-jev-approval/hook.ps1', $hook) + ' -HomePath ' + $testRoot
+    $shellInput = @{ hook_event_name = 'UserPromptSubmit'; session_id = [Guid]::NewGuid().ToString(); turn_id = 'shell'; prompt = 'shell test' } | ConvertTo-Json -Compress
+    foreach ($shell in 'pwsh', 'cmd') {
+        $run = Invoke-ShellCommand $shell $shellCommand $shellInput
+        Assert-True ($run.ExitCode -eq 0 -and [string]::IsNullOrWhiteSpace($run.Stderr)) "Example hook command failed under $shell (exit $($run.ExitCode)): $($run.Stderr)"
+    }
+    $null = Invoke-Hook @{ hook_event_name = 'SessionEnd'; session_id = ($shellInput | ConvertFrom-Json).session_id } ''
+    # The form that broke real sessions: a quoted executable path is a string expression in PowerShell.
+    $quoted = '"' + $pwsh + '" -NoLogo -NoProfile -NonInteractive -File "' + $hook + '" -HomePath "' + $testRoot + '"'
+    Assert-True ((Invoke-ShellCommand 'pwsh' $quoted $shellInput).ExitCode -ne 0) 'Quoted-path regression check no longer reproduces the PowerShell parse failure'
+    $passed++
+
     $session = [Guid]::NewGuid().ToString()
     $turn = [Guid]::NewGuid().ToString()
     $prompt = 'Please read the report in Documents to diagnose the test failure.'
@@ -181,6 +221,52 @@ try {
     Assert-True ($result.Count -eq 1 -and -not (($captured.state | ConvertTo-Json -Depth 8) -match 'topsecret')) 'Tool output leaked to Jev'
     $passed++
 
+    $secretCommandSession = [Guid]::NewGuid().ToString()
+    $secretTurn = [Guid]::NewGuid().ToString()
+    $null = Invoke-Hook @{ hook_event_name = 'UserPromptSubmit'; session_id = $secretCommandSession; turn_id = $secretTurn; prompt = 'Inspect the report.' } ''
+    $null = Invoke-Hook @{ hook_event_name = 'PostToolUse'; session_id = $secretCommandSession; turn_id = $secretTurn; tool_name = 'Bash'; tool_input = @{ command = 'Get-ChildItem -Name' } } ''
+    $null = Invoke-Hook @{ hook_event_name = 'PostToolUse'; session_id = $secretCommandSession; turn_id = $secretTurn; tool_name = 'Bash'; tool_input = @{ command = ('curl -H "Authorization: Bearer ' + 'placeholder-value"') } } ''
+    $secretRequest = @{
+        hook_event_name = 'PermissionRequest'; session_id = $secretCommandSession; turn_id = $secretTurn
+        tool_name = 'Bash'; cwd = 'C:\Users\example\Project'; tool_input = @{ command = 'Get-Content C:\Users\example\Documents\report.txt' }
+    }
+    $firstMock = Write-Mock 'need_context' 'unclear_effect' 0.95 'response-secret.json'
+    $secondMock = Write-Mock 'allow' 'none' 0.99 'response-second.json'
+    Assert-True (@((Invoke-Hook $secretRequest $firstMock $secondMock)).Count -eq 0) 'Incomplete command history was expanded for automatic approval'
+    $audit = Get-Content (Join-Path $testRoot 'audit.jsonl') -Tail 1 | ConvertFrom-Json
+    Assert-True ($audit.api_calls -eq 1 -and $audit.reason -eq 'no_more_local_context') 'Incomplete command history made a second call'
+    $secretTurn = [Guid]::NewGuid().ToString()
+    $null = Invoke-Hook @{ hook_event_name = 'UserPromptSubmit'; session_id = $secretCommandSession; turn_id = $secretTurn; prompt = 'Read the report again.' } ''
+    $secretRequest.turn_id = $secretTurn
+    $mock = Write-Mock 'allow' 'none' 0.99
+    Assert-True (@((Invoke-Hook $secretRequest $mock)).Count -eq 1) 'A secret-like command disabled review for later turns'
+    $passed++
+
+    $parallelSession = [Guid]::NewGuid().ToString()
+    $parallelTurn = [Guid]::NewGuid().ToString()
+    $null = Invoke-Hook @{ hook_event_name = 'UserPromptSubmit'; session_id = $parallelSession; turn_id = $parallelTurn; prompt = 'List the project files.' } ''
+    $processes = foreach ($i in 1..4) {
+        $json = @{ hook_event_name = 'PostToolUse'; session_id = $parallelSession; turn_id = $parallelTurn; tool_name = 'Bash'; tool_input = @{ command = "Get-ChildItem -Name part$i" } } | ConvertTo-Json -Compress
+        $startInfo = [Diagnostics.ProcessStartInfo]::new($pwsh)
+        foreach ($argument in '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $hook, '-HomePath', $testRoot) { $startInfo.ArgumentList.Add($argument) }
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardInput = $true
+        $process = [Diagnostics.Process]::Start($startInfo)
+        $process.StandardInput.Write($json)
+        $process.StandardInput.Close()
+        $process
+    }
+    foreach ($process in $processes) { $process.WaitForExit(); Assert-True ($process.ExitCode -eq 0) 'Parallel PostToolUse hook failed' }
+    $parallelRequest = @{
+        hook_event_name = 'PermissionRequest'; session_id = $parallelSession; turn_id = $parallelTurn
+        tool_name = 'Bash'; cwd = 'C:\Users\example\Project'; tool_input = @{ command = 'Get-Content README.md' }
+    }
+    $parallelMock = Write-Mock 'need_context' 'unclear_effect' 0.95 'response-parallel.json'
+    $null = Invoke-Hook $parallelRequest $parallelMock $secondMock
+    $secondRequest = Get-Content -Raw (Join-Path $testRoot 'stage-2-request.json') | ConvertFrom-Json
+    Assert-True ($secondRequest.state.prior_executed_commands.Count -eq 4) "Parallel PostToolUse hooks lost updates ($($secondRequest.state.prior_executed_commands.Count) of 4 kept)"
+    $passed++
+
     $longSession = [Guid]::NewGuid().ToString()
     $promptEvent.session_id = $longSession
     $promptEvent.prompt = ('a' * 6001)
@@ -211,7 +297,22 @@ try {
     Assert-True (@((Invoke-Hook $request $mock)).Count -eq 0) 'Malformed Jev response was automatically allowed'
     $passed++
 
-    $endEvent = @{ hook_event_name = 'SessionEnd'; session_id = $secretSession }
+    $settingsPath = Join-Path $testRoot 'settings.json'
+    $validSettings = [IO.File]::ReadAllText($settingsPath)
+    [IO.File]::WriteAllText($settingsPath, '{"api_url":"file:///invalid","model":"invalid"}')
+    Assert-True (@((Invoke-Hook $request $mock)).Count -eq 0) 'Invalid endpoint did not fail open to native approval'
+    [IO.File]::WriteAllText($settingsPath, $validSettings)
+    $passed++
+
+    $staleState = Join-Path (Join-Path $testRoot 'state') 'stale.dpapi'
+    [IO.File]::WriteAllText($staleState, 'stale')
+    [IO.File]::SetLastWriteTimeUtc($staleState, [DateTime]::UtcNow.AddDays(-8))
+    $endEvent = @{ hook_event_name = 'SessionEnd'; session_id = $secretCommandSession }
+    $null = Invoke-Hook $endEvent ''
+    Assert-True (-not [IO.File]::Exists($staleState)) 'SessionEnd did not expire stale session state'
+    $endEvent.session_id = $parallelSession
+    $null = Invoke-Hook $endEvent ''
+    $endEvent.session_id = $secretSession
     $null = Invoke-Hook $endEvent ''
     $endEvent.session_id = $longSession
     $null = Invoke-Hook $endEvent ''

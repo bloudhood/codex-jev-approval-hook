@@ -6,7 +6,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$Clock = [Diagnostics.Stopwatch]::StartNew()
 
+# Codex kills PermissionRequest hooks after the timeout in hooks.json (12 seconds).
+# Shell and PowerShell startup happen before this script runs, so keep a margin.
+$DecisionBudgetSeconds = 9
+$StateLockWaitMilliseconds = 3000
+$StateRetentionDays = 7
 $MaxPromptChars = 12000
 $MaxContextChars = 12000
 $MaxCommandChars = 4000
@@ -77,17 +83,53 @@ function Save-State([string]$SessionId, [hashtable]$State) {
     }
 }
 
-function Write-Audit([string]$SessionId, [string]$Decision, [string]$Reason, [int]$Tokens = 0, [int]$Calls = 0) {
+# Serializes read-modify-write of one session's state; Codex may run parallel tool calls.
+function Enter-StateLock([string]$SessionId) {
+    $mutex = [Threading.Mutex]::new($false, 'Local\codex-jev-approval-' + (Get-SessionHash $SessionId).Substring(0, 32))
     try {
-        $entry = @{
+        if (-not $mutex.WaitOne($StateLockWaitMilliseconds)) { throw 'Timed out waiting for the session state lock' }
+    } catch [Threading.AbandonedMutexException] {
+        # The previous holder exited; its atomic state write either completed or never happened.
+    } catch {
+        $mutex.Dispose()
+        throw
+    }
+    $script:StateLock = $mutex
+}
+
+function Exit-StateLock {
+    if ($script:StateLock) {
+        $script:StateLock.ReleaseMutex()
+        $script:StateLock.Dispose()
+        $script:StateLock = $null
+    }
+}
+
+function Remove-StaleState {
+    $directory = Join-Path $HomePath 'state'
+    if (-not [IO.Directory]::Exists($directory)) { return }
+    $cutoff = [DateTime]::UtcNow.AddDays(-$StateRetentionDays)
+    foreach ($file in [IO.DirectoryInfo]::new($directory).GetFiles('*')) {
+        if ($file.LastWriteTimeUtc -lt $cutoff) {
+            try { $file.Delete() } catch { }
+        }
+    }
+}
+
+function Write-Audit([string]$SessionId, [string]$Decision, [string]$Reason, [int]$Tokens = 0, [int]$Calls = 0, [string]$ErrorType) {
+    try {
+        $entry = [ordered]@{
             time = [DateTimeOffset]::UtcNow.ToString('o')
             session = (Get-SessionHash $SessionId).Substring(0, 12)
             decision = $Decision
             reason = $Reason
             input_tokens = $Tokens
             api_calls = $Calls
-        } | ConvertTo-Json -Compress
-        [IO.File]::AppendAllText((Join-Path $HomePath 'audit.jsonl'), $entry + [Environment]::NewLine)
+            elapsed_ms = [int]$Clock.ElapsedMilliseconds
+        }
+        # Exception type only: messages can echo request data.
+        if ($ErrorType) { $entry.error_type = $ErrorType }
+        [IO.File]::AppendAllText((Join-Path $HomePath 'audit.jsonl'), ($entry | ConvertTo-Json -Compress) + [Environment]::NewLine)
     } catch {
         # Audit failure must never turn an uncertain decision into approval.
     }
@@ -107,9 +149,10 @@ function Get-Settings {
     if (-not [IO.File]::Exists($path)) { throw 'settings.json is missing' }
     $settings = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($path)) -AsHashtable
     $uri = [Uri]$settings.api_url
-    $timeout = if ($settings.timeout_seconds) { [int]$settings.timeout_seconds } else { 5 }
-    if ($uri.Scheme -ne 'https' -or [string]::IsNullOrWhiteSpace([string]$settings.model) -or $timeout -lt 1 -or $timeout -gt 5) {
-        throw 'settings.json requires an HTTPS api_url and a model'
+    $settings.timeout_seconds = if ($settings.timeout_seconds) { [int]$settings.timeout_seconds } else { 5 }
+    if ($uri.Scheme -ne 'https' -or [string]::IsNullOrWhiteSpace([string]$settings.model) -or
+        $settings.timeout_seconds -lt 1 -or $settings.timeout_seconds -gt 5) {
+        throw 'settings.json requires an HTTPS api_url, a model, and timeout_seconds between 1 and 5'
     }
     return $settings
 }
@@ -131,7 +174,11 @@ function Test-HighRiskCommand([string]$Command) {
     return $Command -match '(?i)(\b(Remove-Item|Set-Content|Add-Content|Clear-Content|Copy-Item|Move-Item|New-Item|Out-File|Invoke-Item)\b|\brm\s+-[a-z]*[rf]|\b(del|erase|rmdir|rd|mkdir|cp|mv)\b|\bgit\s+(reset\s+--hard|clean\b|push\b|clone\b)|\b(iex|Invoke-Expression|Start-Process|schtasks|Set-ItemProperty|New-Service|setx)\b|\breg\s+add\b|\b(npm|pnpm|yarn|pip|uv|cargo|winget|choco)\s+(install|add)\b|\bgh\s+(release|pr\s+(create|merge))\b|\b(python|node|pwsh|powershell|cmd)\b.*\s+(-c|-Command|/c)\b|\bEncodedCommand\b|\b(POST|PUT|PATCH|--data|--upload-file|--form|--output|-OutFile)\b|\.(ps1|bat|cmd|sh|py|js|exe)\b|\.ssh[\\/]|\.codex[\\/](auth|config)|\.env\b|[;&|><`$])'
 }
 
-function Invoke-Jev([string]$Request, [int]$Pass) {
+function Invoke-Jev([hashtable]$Settings, [string]$Request, [int]$Pass) {
+    # Stop before Codex's hook timeout would discard the result anyway.
+    $timeout = [Math]::Min($Settings.timeout_seconds, [Math]::Floor($DecisionBudgetSeconds - $Clock.Elapsed.TotalSeconds))
+    if ($timeout -lt 1) { throw 'Decision time budget exhausted' }
+
     if ($MockResponsePath) {
         [IO.File]::WriteAllText((Join-Path $HomePath 'last-request.json'), $Request)
         [IO.File]::WriteAllText((Join-Path $HomePath "stage-$Pass-request.json"), $Request)
@@ -140,10 +187,9 @@ function Invoke-Jev([string]$Request, [int]$Pass) {
         return ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($path)) -AsHashtable
     }
 
-    $settings = Get-Settings
-    $apiKey = Get-ApiKey $settings
+    $apiKey = Get-ApiKey $Settings
     try {
-        return Invoke-RestMethod -Uri ([string]$settings.api_url) -Method Post -Headers @{ Authorization = "Bearer $apiKey" } -ContentType 'application/json' -Body $Request -TimeoutSec ([int]$(if ($settings.timeout_seconds) { $settings.timeout_seconds } else { 5 }))
+        return Invoke-RestMethod -Uri ([string]$Settings.api_url) -Method Post -Headers @{ Authorization = "Bearer $apiKey" } -ContentType 'application/json' -Body $Request -TimeoutSec $timeout
     } finally {
         Remove-Variable apiKey -ErrorAction SilentlyContinue
     }
@@ -152,23 +198,26 @@ function Invoke-Jev([string]$Request, [int]$Pass) {
 try {
     $raw = [Console]::In.ReadToEnd()
     if ([string]::IsNullOrWhiteSpace($raw)) { exit 0 }
-    $event = ConvertFrom-Json -InputObject $raw -AsHashtable
-    $eventName = [string]$event.hook_event_name
-    $sessionId = [string]$event.session_id
+    # Not $event: that name is a PowerShell automatic variable.
+    $hookInput = ConvertFrom-Json -InputObject $raw -AsHashtable
+    $eventName = [string]$hookInput.hook_event_name
+    $sessionId = [string]$hookInput.session_id
     if ([string]::IsNullOrWhiteSpace($sessionId)) { exit 0 }
 
     if ($eventName -eq 'UserPromptSubmit') {
-        $prompt = [string]$event.prompt
+        $prompt = [string]$hookInput.prompt
+        Enter-StateLock $sessionId
         $state = Read-State $sessionId
         $messages = @($state.messages)
         $messages += @{
-            turn_id = [string]$event.turn_id
+            turn_id = [string]$hookInput.turn_id
             text = $(if ($prompt.Length -le $MaxPromptChars) { $prompt } else { '' })
             too_long = ($prompt.Length -gt $MaxPromptChars)
         }
         if ($messages.Count -gt $MaxMessages) { $state.history_incomplete = $true }
         $state.messages = @($messages | Select-Object -Last $MaxMessages)
         $state.prior_commands = @()
+        $state.incomplete_command_turn = ''
         Save-State $sessionId $state
         exit 0
     }
@@ -176,17 +225,21 @@ try {
     if ($eventName -eq 'SessionEnd') {
         $statePath = Get-StatePath $sessionId
         if ([IO.File]::Exists($statePath)) { [IO.File]::Delete($statePath) }
+        # Interrupted sessions never send SessionEnd; expire their encrypted state here.
+        Remove-StaleState
         exit 0
     }
 
-    if ($eventName -eq 'PostToolUse' -and $event.tool_name -eq 'Bash') {
-        $state = Read-State $sessionId
-        $turnId = [string]$event.turn_id
-        if (-not @($state.messages | Where-Object { $_.turn_id -eq $turnId }).Count) { exit 0 }
-        $command = [string]$event.tool_input.command
+    if ($eventName -eq 'PostToolUse' -and $hookInput.tool_name -eq 'Bash') {
+        $turnId = [string]$hookInput.turn_id
+        $command = [string]$hookInput.tool_input.command
         if ([string]::IsNullOrWhiteSpace($command)) { exit 0 }
+        Enter-StateLock $sessionId
+        $state = Read-State $sessionId
+        if (-not @($state.messages | Where-Object { $_.turn_id -eq $turnId }).Count) { exit 0 }
         if ($command.Length -gt $MaxCommandChars -or $command -match $SensitivePattern) {
-            $state.history_incomplete = $true
+            # Only this turn's command history is incomplete; the first review never sends it.
+            $state.incomplete_command_turn = $turnId
             Save-State $sessionId $state
             exit 0
         }
@@ -200,9 +253,9 @@ try {
         exit 0
     }
 
-    if ($eventName -ne 'PermissionRequest' -or $event.tool_name -ne 'Bash') { exit 0 }
-    $command = [string]$event.tool_input.command
-    $turnId = [string]$event.turn_id
+    if ($eventName -ne 'PermissionRequest' -or $hookInput.tool_name -ne 'Bash') { exit 0 }
+    $command = [string]$hookInput.tool_input.command
+    $turnId = [string]$hookInput.turn_id
     $state = Read-State $sessionId
     $messages = @($state.messages)
     if (-not $messages.Count -or $messages.Count -gt $MaxMessages -or $state.history_incomplete -or
@@ -219,6 +272,7 @@ try {
         exit 0
     }
     $priorCommands = @($state.prior_commands | Where-Object { $_.turn_id -eq $turnId })
+    $canExpand = $priorCommands.Count -gt 0 -and [string]$state.incomplete_command_turn -ne $turnId
     if (($userMessages -join "`n") -match $SensitivePattern -or $command -match $SensitivePattern) {
         Write-Audit $sessionId 'user' 'possible_secret'
         exit 0
@@ -229,14 +283,15 @@ try {
         user_messages = $userMessages
         prior_executed_commands = @()
         omitted_prior_command_count = $priorCommands.Count
-        more_local_context_available = ($priorCommands.Count -gt 0)
+        more_local_context_available = $canExpand
         review_stage = 'initial'
-        cwd = [string]$event.cwd
+        cwd = [string]$hookInput.cwd
         proposed_command = $command
         pre_change_record_verified = $false
     }
+    $settings = Get-Settings
     $requestData = @{
-        model = [string](Get-Settings).model
+        model = [string]$settings.model
         state = $stateForJev
         questions = @{
             decision = @{
@@ -268,11 +323,15 @@ try {
     }
 
     $calls = 1
-    $response = Invoke-Jev ($requestData | ConvertTo-Json -Depth 12 -Compress) $calls
+    $response = Invoke-Jev $settings ($requestData | ConvertTo-Json -Depth 12 -Compress) $calls
     $tokens = [int]$response.usage.input_tokens
     if ([string]$response.answers.decision.choice -eq 'need_context') {
-        if (-not $priorCommands.Count) {
+        if (-not $canExpand) {
             Write-Audit $sessionId 'user' 'no_more_local_context' $tokens $calls
+            exit 0
+        }
+        if ($DecisionBudgetSeconds - $Clock.Elapsed.TotalSeconds -lt 2) {
+            Write-Audit $sessionId 'user' 'time_budget_exhausted' $tokens $calls
             exit 0
         }
         $requestData.state.prior_executed_commands = $priorCommands
@@ -281,7 +340,7 @@ try {
         $requestData.state.review_stage = 'expanded'
         $requestData.questions.decision.instructions = 'All locally available context is now supplied. Choose allow, ask_user, or deny; if uncertainty remains, ask the user.'
         $calls = 2
-        $response = Invoke-Jev ($requestData | ConvertTo-Json -Depth 12 -Compress) $calls
+        $response = Invoke-Jev $settings ($requestData | ConvertTo-Json -Depth 12 -Compress) $calls
         $tokens += [int]$response.usage.input_tokens
     }
 
@@ -304,6 +363,9 @@ try {
     }
     Write-Audit $sessionId 'user' $(if ($decision -eq 'allow') { 'allow_not_verified' } elseif ($decision -eq 'need_context') { 'context_still_insufficient' } else { $reason }) $tokens $calls
 } catch {
-    if ($sessionId) { Write-Audit $sessionId 'user' 'hook_error' ([int]$tokens) ([int]$calls) }
-    # No decision delegates to Codex's native user approval.
+    if ($sessionId) { Write-Audit $sessionId 'user' 'hook_error' ([int]$tokens) ([int]$calls) $_.Exception.GetType().Name }
+    # No decision delegates to Codex's native user approval; a nonzero exit would surface as a hook failure.
+    exit 0
+} finally {
+    Exit-StateLock
 }

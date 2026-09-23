@@ -19,12 +19,16 @@ To use a DPAPI file, run `pwsh -NoProfile -File .\protect-key.ps1 -OutputPath .\
 
 ## Install as a Codex hook
 
-Place the project in a stable user-owned directory and point Codex hook commands to its absolute `hook.ps1` path. Configure these events:
+Place the project in a stable user-owned directory whose path contains no spaces, then copy `hooks.example.json` to `~/.codex/hooks.json` and replace `C:/path/to/codex-jev-approval/hook.ps1` with the absolute path of `hook.ps1`. It configures:
 
 - `UserPromptSubmit`: pass the event JSON to `hook.ps1`.
 - `PostToolUse` filtered to `Bash`: pass the event JSON to `hook.ps1`.
 - `PermissionRequest` filtered to `Bash`: pass the event JSON to `hook.ps1` and use a 12-second timeout.
 - `SessionEnd`: pass the event JSON to `hook.ps1`.
+
+Keep the command in the unquoted `pwsh ... -File <path>` form. Codex runs hook commands through the session shell (`pwsh -Command` when that is PowerShell, `cmd.exe /c` otherwise); a command starting with a quoted executable path such as `"C:\Program Files\PowerShell\7\pwsh.exe" ...` is a PowerShell parse error and every hook fails with exit code 1. `tests.ps1` runs the example command through both shells.
+
+Codex asks you to review hooks again whenever a hook command changes; open `/hooks` in a new session and trust the updated entries.
 
 Use `approval_policy = "on-request"`, `approvals_reviewer = "user"`, and a sandbox mode that preserves Codex's intended command boundary. The hook handles only Bash permission requests; commands already permitted by the sandbox do not reach this reviewer. Keep the native user approval path enabled by using `on-request`.
 
@@ -34,7 +38,9 @@ The first request contains up to six original user messages (maximum 12,000 comb
 
 Only a high-confidence low-risk allow result automatically approves. High-risk command patterns, uncertain responses, API errors, and missing context fall back to native approval. Clear denials return a reason to Codex. This hook reviews requests; it is not a sandbox or a complete enforcement boundary.
 
-Session context is encrypted with DPAPI and removed on `SessionEnd`; an interrupted session may leave encrypted state behind. `audit.jsonl` records timestamps, short session hashes, decision categories, token totals, and call counts, but not prompt or command text. Review and remove local audit data according to your retention needs.
+A prior command that is oversized or secret-like is not stored; for that turn the hook never sends a follow-up request. Parallel tool calls update session state under a per-session lock. The whole decision, including a follow-up request, is kept within the hook timeout; if time runs out, Codex's native approval takes over.
+
+Session context is encrypted with DPAPI and removed on `SessionEnd`; state left by interrupted sessions expires after seven days. `audit.jsonl` records timestamps, short session hashes, decision categories, token totals, call counts, elapsed time, and for hook errors the exception type, but not prompt or command text or error messages. Review and remove local audit data according to your retention needs.
 
 ## Test
 

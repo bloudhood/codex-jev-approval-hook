@@ -1,0 +1,52 @@
+{
+  "description": "Jev review for Codex shell approval requests",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoLogo -NoProfile -NonInteractive -File C:/path/to/codex-jev-approval/hook.ps1",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoLogo -NoProfile -NonInteractive -File C:/path/to/codex-jev-approval/hook.ps1",
+            "timeout": 12,
+            "statusMessage": "Reviewing shell approval"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoLogo -NoProfile -NonInteractive -File C:/path/to/codex-jev-approval/hook.ps1",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoLogo -NoProfile -NonInteractive -File C:/path/to/codex-jev-approval/hook.ps1",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

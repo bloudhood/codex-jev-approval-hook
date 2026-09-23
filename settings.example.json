@@ -1,0 +1,7 @@
+{
+  "api_url": "https://openrouter.ai/api/alpha/decisions",
+  "model": "typesafe/jev-1.13",
+  "api_key_env": "JEV_API_KEY",
+  "api_key_file": "api-key.dpapi",
+  "timeout_seconds": 5
+}

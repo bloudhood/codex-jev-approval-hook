@@ -1,0 +1,9 @@
+settings.json
+*.dpapi
+.env
+state/
+audit.jsonl
+last-request.json
+stage-*-request.json
+.test-*/
+*.bak*

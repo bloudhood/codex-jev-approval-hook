@@ -209,7 +209,23 @@ try {
     $promptEvent.prompt = ('Use ' + 'api_key' + '=fake-placeholder to inspect the report.')
     $null = Invoke-Hook $promptEvent ''
     $request.session_id = $secretSession
-    Assert-True (@((Invoke-Hook $request $mock)).Count -eq 0) 'Secret-like prompt was sent for automatic approval'
+    $result = @((Invoke-Hook $request $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json')
+    Assert-True ($result.Count -eq 1 -and $captured.Contains('api_key=[REDACTED]') -and -not $captured.Contains('fake-placeholder') -and
+        ($captured | ConvertFrom-Json).state.redacted_secret_count -eq 1) 'Secret-like prompt was not redacted before review'
+    $stateText = @(Get-ChildItem (Join-Path $testRoot 'state') -Filter '*.dpapi' | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join ''
+    Assert-True (-not $stateText.Contains('fake-placeholder')) 'Secret stored in plain text'
+    $passed++
+
+    $request.tool_input.command = ('Invoke-RestMethod https://example.test -Headers @{ Authorization = "Bearer ' + 'placeholder-token" }')
+    $null = Invoke-Hook $request $mock
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json')
+    Assert-True ($captured.Contains('Bearer [REDACTED]') -and -not $captured.Contains('placeholder-token')) 'Secret in the proposed command was sent to Jev'
+    $request.tool_input.command = ('Write-Output "' + '-----BEGIN ' + 'RSA PRIVATE KEY-----' + 'MIIE' + '"')
+    $null = Invoke-Hook $request $mock
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json')
+    Assert-True (-not $captured.Contains('MIIE')) 'Private key material was sent to Jev'
+    $request.tool_input.command = 'Get-Content C:\Users\example\Documents\report.txt'
     $passed++
 
     $request.session_id = $session
@@ -226,20 +242,31 @@ try {
     $null = Invoke-Hook @{ hook_event_name = 'UserPromptSubmit'; session_id = $secretCommandSession; turn_id = $secretTurn; prompt = 'Inspect the report.' } ''
     $null = Invoke-Hook @{ hook_event_name = 'PostToolUse'; session_id = $secretCommandSession; turn_id = $secretTurn; tool_name = 'Bash'; tool_input = @{ command = 'Get-ChildItem -Name' } } ''
     $null = Invoke-Hook @{ hook_event_name = 'PostToolUse'; session_id = $secretCommandSession; turn_id = $secretTurn; tool_name = 'Bash'; tool_input = @{ command = ('curl -H "Authorization: Bearer ' + 'placeholder-value"') } } ''
+    $firstMock = Write-Mock 'need_context' 'unclear_effect' 0.95 'response-secret.json'
+    $secondMock = Write-Mock 'allow' 'none' 0.99 'response-second.json'
+    $redactedRequest = @{
+        hook_event_name = 'PermissionRequest'; session_id = $secretCommandSession; turn_id = $secretTurn
+        tool_name = 'Bash'; cwd = 'C:\Users\example\Project'; tool_input = @{ command = 'Get-Content C:\Users\example\Documents\report.txt' }
+    }
+    $null = Invoke-Hook $redactedRequest $firstMock $secondMock
+    $secondRequest = Get-Content -Raw (Join-Path $testRoot 'stage-2-request.json')
+    Assert-True ($secondRequest.Contains('Bearer [REDACTED]') -and -not $secondRequest.Contains('placeholder-value') -and
+        ($secondRequest | ConvertFrom-Json).state.prior_executed_commands.Count -eq 2) 'Secret-bearing prior command was not kept in redacted form'
+    $null = Invoke-Hook @{ hook_event_name = 'PostToolUse'; session_id = $secretCommandSession; turn_id = $secretTurn; tool_name = 'Bash'; tool_input = @{ command = ('Get-ChildItem ' + ('x' * 4001)) } } ''
     $secretRequest = @{
         hook_event_name = 'PermissionRequest'; session_id = $secretCommandSession; turn_id = $secretTurn
         tool_name = 'Bash'; cwd = 'C:\Users\example\Project'; tool_input = @{ command = 'Get-Content C:\Users\example\Documents\report.txt' }
     }
     $firstMock = Write-Mock 'need_context' 'unclear_effect' 0.95 'response-secret.json'
     $secondMock = Write-Mock 'allow' 'none' 0.99 'response-second.json'
-    Assert-True (@((Invoke-Hook $secretRequest $firstMock $secondMock)).Count -eq 0) 'Incomplete command history was expanded for automatic approval'
+    Assert-True (@((Invoke-Hook $secretRequest $firstMock $secondMock)).Count -eq 0) 'Oversized command history was expanded for automatic approval'
     $audit = Get-Content (Join-Path $testRoot 'audit.jsonl') -Tail 1 | ConvertFrom-Json
-    Assert-True ($audit.api_calls -eq 1 -and $audit.reason -eq 'no_more_local_context') 'Incomplete command history made a second call'
+    Assert-True ($audit.api_calls -eq 1 -and $audit.reason -eq 'no_more_local_context') 'Oversized command history made a second call'
     $secretTurn = [Guid]::NewGuid().ToString()
     $null = Invoke-Hook @{ hook_event_name = 'UserPromptSubmit'; session_id = $secretCommandSession; turn_id = $secretTurn; prompt = 'Read the report again.' } ''
     $secretRequest.turn_id = $secretTurn
     $mock = Write-Mock 'allow' 'none' 0.99
-    Assert-True (@((Invoke-Hook $secretRequest $mock)).Count -eq 1) 'A secret-like command disabled review for later turns'
+    Assert-True (@((Invoke-Hook $secretRequest $mock)).Count -eq 1) 'An oversized command disabled review for later turns'
     $passed++
 
     $parallelSession = [Guid]::NewGuid().ToString()

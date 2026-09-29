@@ -1,1 +1,1 @@
-Codex permission hook that reviews Bash approval requests with a configurable Jev-compatible Decisions API.
+Codex permission hook that reviews Bash, apply_patch, and MCP approval requests with a configurable Jev-compatible Decisions API. High-confidence low-risk approvals proceed automatically; uncertain or high-risk actions return to Codex's native approval flow.

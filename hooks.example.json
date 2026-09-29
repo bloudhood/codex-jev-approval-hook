@@ -14,7 +14,7 @@
     ],
     "PermissionRequest": [
       {
-        "matcher": "^Bash$",
+        "matcher": "^(Bash|apply_patch|mcp__.*)$",
         "hooks": [
           {
             "type": "command",

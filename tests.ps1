@@ -17,7 +17,7 @@ if (-not $resolvedTest.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgno
 } | ConvertTo-Json))
 
 function Invoke-Hook([hashtable]$Event, [string]$MockResponsePath, [string]$MockSecondResponsePath) {
-    $json = $Event | ConvertTo-Json -Depth 8 -Compress
+    $json = $Event | ConvertTo-Json -Depth 100 -Compress -WarningAction Stop
     $output = $json | & $pwsh -NoLogo -NoProfile -NonInteractive -File $hook -HomePath $testRoot -MockResponsePath $MockResponsePath -MockSecondResponsePath $MockSecondResponsePath
     if ($LASTEXITCODE -ne 0) { throw "Hook exited with $LASTEXITCODE" }
     return @($output)
@@ -107,6 +107,117 @@ try {
         $firstRequest.state.prior_executed_commands.Count -eq 0) 'Initial request included unnecessary history'
     $passed++
 
+    $patchRequest = @{
+        hook_event_name = 'PermissionRequest'; session_id = $session; turn_id = $turn
+        tool_name = 'apply_patch'; cwd = 'C:\Users\example\Project'
+        tool_input = @{ command = '*** Begin Patch`n*** Update File: README.md`n+note`n' }
+    }
+    $mock = Write-Mock 'allow' 'none' 0.99 'response-apply-patch.json'
+    $result = @((Invoke-Hook $patchRequest $mock))
+    Assert-True ($result.Count -eq 1 -and ($result[0] | ConvertFrom-Json).hookSpecificOutput.decision.behavior -eq 'allow') 'Jev allow did not approve apply_patch'
+    $mcpRequest = @{
+        hook_event_name = 'PermissionRequest'; session_id = $session; turn_id = $turn
+        tool_name = 'mcp__filesystem__read_file'; cwd = 'C:\Users\example\Project'
+        tool_input = @{ path = 'README.md' }
+    }
+    $mock = Write-Mock 'allow' 'none' 0.99 'response-mcp.json'
+    $result = @((Invoke-Hook $mcpRequest $mock))
+    Assert-True ($result.Count -eq 1 -and ($result[0] | ConvertFrom-Json).hookSpecificOutput.decision.behavior -eq 'allow') 'Jev allow did not approve MCP'
+    $mcpRequest.tool_input = @{ command = 'read'; path = 'README.md'; recursive = $false }
+    $result = @((Invoke-Hook $mcpRequest $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and $captured.state.proposed_command.Contains('"path":"README.md"') -and
+        $captured.state.proposed_command.Contains('"recursive":false')) 'MCP arguments were truncated when an argument was named command'
+    $nested = @{ leaf = 'retained' }
+    for ($i = 1; $i -le 13; $i++) { $nested = @{ inner = $nested } }
+    $mcpRequest.tool_input = @{ payload = $nested }
+    $result = @((Invoke-Hook $mcpRequest $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and $captured.state.proposed_command.Contains('"leaf":"retained"')) 'Nested MCP arguments were truncated before review'
+    $mcpRequest.tool_input = @{ command = 'read'; path = 'README.md'; recursive = $false }
+    $patchDeleteRequest = $patchRequest.Clone()
+    $patchDeleteRequest.tool_input = @{ command = "*** Begin Patch`n*** Delete File: old.txt`n" }
+    Assert-True (@((Invoke-Hook $patchDeleteRequest $mock)).Count -eq 0) 'High-risk apply_patch was automatically allowed'
+    $mcpDeleteRequest = $mcpRequest.Clone()
+    $mcpDeleteRequest.tool_name = 'mcp__filesystem__delete_file'
+    Assert-True (@((Invoke-Hook $mcpDeleteRequest $mock)).Count -eq 0) 'High-risk MCP action was automatically allowed'
+    $mcpReadUrlRequest = $mcpRequest.Clone()
+    $mcpReadUrlRequest.tool_name = 'mcp__writeup__fetch_url'
+    $mcpReadUrlRequest.tool_input = @{ url = 'https://example.test/docs' }
+    Assert-True (@((Invoke-Hook $mcpReadUrlRequest $mock)).Count -eq 1) 'Benign MCP URL read was sent to native approval'
+    $passed++
+
+    $mock = Write-Mock 'allow' 'none' 0.90 'response-mcp-uncertain.json'
+    Assert-True (@((Invoke-Hook $mcpRequest $mock)).Count -eq 0) 'Low-confidence MCP allow skipped native approval'
+    $mock = Write-Mock 'allow' 'none' 0.99 'response-patch-confident.json'
+    $patchRequest.tool_input.command = '*** Begin Patch`n*** Update File: README.md`n+token=example-secret-value`n'
+    $null = Invoke-Hook $patchRequest $mock
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True (-not (($captured | ConvertTo-Json -Depth 12) -match 'example-secret-value') -and
+        $captured.state.proposed_command.Contains('token=[REDACTED]')) 'Patch secret was sent to Jev'
+    $passed++
+
+    $mock = Write-Mock 'deny' 'outside_scope' 0.99 'response-mcp-deny.json'
+    $result = @((Invoke-Hook $mcpRequest $mock))
+    Assert-True ($result.Count -eq 1 -and ($result[0] | ConvertFrom-Json).hookSpecificOutput.decision.behavior -eq 'deny') 'MCP denial was not returned to Codex'
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($captured.state.tool_name -eq 'mcp__filesystem__read_file' -and $captured.state.proposed_command.Contains('README.md')) 'MCP identity and arguments were not sent'
+    $passed++
+
+    $instructionSession = [Guid]::NewGuid().ToString()
+    $instructionTurn = [Guid]::NewGuid().ToString()
+    $instructionPath = Join-Path $testRoot 'AGENTS.md'
+    [IO.File]::WriteAllText($instructionPath, "Do not publish or deploy without review.`n")
+    $instructionPrompt = @{ hook_event_name = 'UserPromptSubmit'; session_id = $instructionSession; turn_id = $instructionTurn; cwd = $testRoot; prompt = 'Inspect the project.' }
+    $null = Invoke-Hook $instructionPrompt ''
+    $instructionRequest = @{
+        hook_event_name = 'PermissionRequest'; session_id = $instructionSession; turn_id = $instructionTurn
+        tool_name = 'Bash'; cwd = $testRoot; tool_input = @{ command = 'Get-ChildItem -Name' }
+    }
+    $mock = Write-Mock 'allow' 'none' 0.99 'response-instruction.json'
+    $result = @((Invoke-Hook $instructionRequest $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and
+        @($captured.state.instruction_context | Where-Object { $_.path -eq $instructionPath -and $_.content.Contains('Do not publish') }).Count -eq 1) 'AGENTS.md context was not included'
+    [IO.File]::WriteAllText($instructionPath, "Do not publish or deploy without review.`nChanged after prompt.`n")
+    Assert-True (@((Invoke-Hook $instructionRequest $mock)).Count -eq 0) 'Changed AGENTS.md context was automatically allowed'
+    $passed++
+
+    $noCwdSession = [Guid]::NewGuid().ToString()
+    $instructionPrompt.session_id = $noCwdSession
+    $instructionPrompt.Remove('cwd')
+    $null = Invoke-Hook $instructionPrompt ''
+    $instructionRequest.session_id = $noCwdSession
+    $result = @((Invoke-Hook $instructionRequest $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and
+        @($captured.state.instruction_context | Where-Object { $_.path -eq $instructionPath }).Count -eq 1) 'Permission cwd did not supply project instructions'
+    $passed++
+
+    [IO.File]::WriteAllText($instructionPath, 'token=example-secret-value')
+    $instructionPrompt.session_id = [Guid]::NewGuid().ToString()
+    $instructionPrompt.cwd = $testRoot
+    $null = Invoke-Hook $instructionPrompt ''
+    $instructionRequest.session_id = $instructionPrompt.session_id
+    $result = @((Invoke-Hook $instructionRequest $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and
+        @($captured.state.instruction_context | Where-Object { $_.path -eq $instructionPath -and $_.content.Contains('token=[REDACTED]') }).Count -eq 1 -and
+        -not (($captured | ConvertTo-Json -Depth 12) -match 'example-secret-value')) 'Instruction secret was not redacted'
+    $secretInstructionSession = $instructionPrompt.session_id
+    $passed++
+
+    [IO.File]::WriteAllText($instructionPath, ('x' * 4000))
+    $instructionPrompt.session_id = [Guid]::NewGuid().ToString()
+    $null = Invoke-Hook $instructionPrompt ''
+    $instructionRequest.session_id = $instructionPrompt.session_id
+    $result = @((Invoke-Hook $instructionRequest $mock))
+    $captured = Get-Content -Raw (Join-Path $testRoot 'stage-1-request.json') | ConvertFrom-Json
+    Assert-True ($result.Count -eq 1 -and
+        @($captured.state.instruction_context | Where-Object { $_.path -eq $instructionPath -and $_.truncated -and $_.content.Length -le 3000 }).Count -eq 1) 'Long instruction was not bounded'
+    $longInstructionSession = $instructionPrompt.session_id
+    $passed++
+
     $toolEvent = @{
         hook_event_name = 'PostToolUse'; session_id = $session; turn_id = $turn
         tool_name = 'Bash'; tool_input = @{ command = 'Get-ChildItem -Name' }
@@ -183,6 +294,21 @@ try {
 
     $mock = Write-Mock 'allow' 'none' 0.99
     Assert-True (@((Invoke-Hook $request $mock)).Count -eq 0) 'High-risk command was automatically allowed'
+    $passed++
+
+    $denyBudgetSession = [Guid]::NewGuid().ToString()
+    $promptEvent.session_id = $denyBudgetSession
+    $promptEvent.prompt = 'Inspect the project.'
+    $null = Invoke-Hook $promptEvent ''
+    $request.session_id = $denyBudgetSession
+    $denyMock = Write-Mock 'deny' 'outside_scope' 0.99 'response-deny-budget.json'
+    for ($i = 1; $i -le 3; $i++) {
+        Assert-True (@((Invoke-Hook $request $denyMock)).Count -eq 1) "Denial $i was not returned"
+    }
+    Assert-True (@((Invoke-Hook $request $denyMock)).Count -eq 0) 'Denial budget did not return to native approval'
+    $audit = Get-Content (Join-Path $testRoot 'audit.jsonl') -Tail 1 | ConvertFrom-Json
+    Assert-True ($audit.reason -eq 'deny_budget_exhausted') 'Denial budget exhaustion was not recorded'
+    $request.session_id = $session
     $passed++
 
     $request.tool_input.command = "Set-Content C:\Users\example\Documents\report.txt 'changed'"
@@ -372,6 +498,16 @@ try {
     $endEvent.session_id = $sixSession
     $null = Invoke-Hook $endEvent ''
     $endEvent.session_id = $budgetSession
+    $null = Invoke-Hook $endEvent ''
+    $endEvent.session_id = $denyBudgetSession
+    $null = Invoke-Hook $endEvent ''
+    $endEvent.session_id = $instructionSession
+    $null = Invoke-Hook $endEvent ''
+    $endEvent.session_id = $noCwdSession
+    $null = Invoke-Hook $endEvent ''
+    $endEvent.session_id = $secretInstructionSession
+    $null = Invoke-Hook $endEvent ''
+    $endEvent.session_id = $longInstructionSession
     $null = Invoke-Hook $endEvent ''
     $remaining = @(Get-ChildItem (Join-Path $testRoot 'state') -Filter '*.dpapi')
     Assert-True ($remaining.Count -eq 1) 'SessionEnd did not remove only its session state'
